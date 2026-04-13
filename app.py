@@ -21,7 +21,7 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
-# 模板过滤器
+# ── 模板过滤器 ────────────────────────────────────────────────
 
 @app.template_filter('local_time')
 def local_time(dt):
@@ -53,7 +53,7 @@ def preview(content, query):
     snippet = pattern.sub(f'<mark>{query}</mark>', snippet)
     return ('...' if start > 0 else '') + snippet + ('...' if end < len(content) else '')
 
-# 数据模型
+# ── 数据模型 ──────────────────────────────────────────────────
 
 note_tags = db.Table(
     'note_tags',
@@ -90,9 +90,9 @@ class Note(db.Model):
     user_id    = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     folder_id  = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)
     is_public  = db.Column(db.Boolean, default=False)
-    tags       = db.relationship('Tag', secondary=note_tags, backref='notes')
+    tags       = db.relationship('Tag', secondary=note_tags, backref='notes', lazy='subquery')
 
-# 辅助函数
+# ── 辅助函数 ──────────────────────────────────────────────────
 
 def get_or_404(model, pk):
     """兼容 SQLAlchemy 2.x 的 get_or_404。"""
@@ -103,18 +103,30 @@ def get_or_404(model, pk):
     return obj
 
 
+
+def own_or_403(obj):
+    """校验对象归属当前用户，否则 403。"""
+    from flask import abort
+    if obj.user_id != current_user.id:
+        abort(403)
+
 def sync_tags(note, raw_tags: str):
-    """将逗号分隔的标签字符串同步到 note.tags。"""
-    tag_names = [t.strip() for t in raw_tags.split(',') if t.strip()]
+    """将逗号分隔的标签字符串同步到 note.tags，返回错误信息或 None。"""
+    tag_names = [t.strip() for t in re.split(r'[,，]', raw_tags) if t.strip()]
+    for name in tag_names:
+        if len(name) > 50:
+            return f'标签"{name[:10]}..."超出50字符限制'
     note.tags = []
     for name in tag_names:
         tag = Tag.query.filter_by(name=name).first()
         if not tag:
             tag = Tag(name=name)
             db.session.add(tag)
+            db.session.flush()
         note.tags.append(tag)
+    return None
 
-# 用户认证
+# ── 用户认证 ──────────────────────────────────────────────────
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -125,10 +137,15 @@ def load_user(user_id):
 def register():
     error = None
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if User.query.filter_by(username=username).first():
-            error = '用户名已存在'
+        username         = request.form['username'].strip()
+        password         = request.form['password']
+        confirm_password = request.form['confirm_password']
+        if not username or not password or not confirm_password:
+            error = '请填写完整信息'
+        elif password != confirm_password:
+            error = '两次密码输入不一致'
+        elif User.query.filter_by(username=username).first():
+            error = '用户名已被占用'
         else:
             user = User(username=username, password=generate_password_hash(password))
             db.session.add(user)
@@ -177,19 +194,22 @@ def profile():
                 db.session.commit()
                 success = '用户名修改成功'
         elif action == 'password':
-            old_password = request.form['old_password']
-            new_password = request.form['new_password']
-            if not check_password_hash(current_user.password, old_password):
+            old_password     = request.form['old_password']
+            new_password     = request.form['new_password']
+            confirm_password = request.form['confirm_password']
+            if not old_password or not new_password or not confirm_password:
+                error = '请填写完整信息'
+            elif not check_password_hash(current_user.password, old_password):
                 error = '原密码错误'
-            elif not new_password:
-                error = '新密码不能为空'
+            elif new_password != confirm_password:
+                error = '两次输入的新密码不一致'
             else:
                 current_user.password = generate_password_hash(new_password)
                 db.session.commit()
                 success = '密码修改成功'
     return render_template('profile.html', error=error, success=success)
 
-# 主页
+# ── 主页 ──────────────────────────────────────────────────────
 
 @app.route('/')
 @login_required
@@ -213,29 +233,45 @@ def index():
                .filter(Note.user_id == current_user.id)
                .distinct().all())
 
+    folder_error     = request.args.get('folder_error')
+    open_folder_form = request.args.get('open_folder_form')
     return render_template(
         'index.html', notes=notes, folders=folders, tags=tags,
         current_folder_id=int(folder_id) if folder_id else None,
         current_tag_id=int(tag_id) if tag_id else None,
+        folder_error=folder_error,
+        open_folder_form=open_folder_form,
     )
 
-# 笔记
+# ── 笔记 CRUD ─────────────────────────────────────────────────
 
 @app.route('/notes/new', methods=['GET', 'POST'])
 @login_required
 def new_note():
     if request.method == 'POST':
-        title   = request.form['title']
-        content = request.form['content']
-        if not title.strip():
+        title     = request.form['title']
+        content   = request.form['content']
+        raw_tags  = request.form.get('tags', '')
+        folder_id = request.form.get('folder_id') or None
+
+        def redraw(error):
             folders = Folder.query.filter_by(user_id=current_user.id).all()
-            return render_template('new_note.html', error='标题不能为空', folders=folders)
-        note = Note(
-            title=title, content=content,
-            user_id=current_user.id,
-            folder_id=request.form.get('folder_id') or None,
-        )
-        sync_tags(note, request.form.get('tags', ''))
+            return render_template('new_note.html', error=error, folders=folders,
+                                   form_title=title, form_content=content,
+                                   form_tags=raw_tags, form_folder_id=folder_id)
+
+        if not title.strip():
+            return redraw('标题不能为空')
+
+        # 提前校验标签，不创建 note 对象
+        tag_names = [t.strip() for t in __import__('re').split(r'[,，]', raw_tags) if t.strip()]
+        for name in tag_names:
+            if len(name) > 50:
+                return redraw(f'标签"{name[:10]}..."超出50字符限制')
+
+        note = Note(title=title, content=content,
+                    user_id=current_user.id, folder_id=folder_id)
+        sync_tags(note, raw_tags)
         db.session.add(note)
         db.session.commit()
         return redirect(url_for('index'))
@@ -247,6 +283,7 @@ def new_note():
 @login_required
 def view_note(note_id):
     note = get_or_404(Note, note_id)
+    own_or_403(note)
     return render_template('view_note.html', note=note)
 
 
@@ -254,12 +291,16 @@ def view_note(note_id):
 @login_required
 def edit_note(note_id):
     note = get_or_404(Note, note_id)
+    own_or_403(note)
     if request.method == 'POST':
         note.title      = request.form['title']
         note.content    = request.form['content']
         note.folder_id  = request.form.get('folder_id') or None
         note.updated_at = datetime.utcnow()
-        sync_tags(note, request.form.get('tags', ''))
+        err = sync_tags(note, request.form.get('tags', ''))
+        if err:
+            folders = Folder.query.filter_by(user_id=current_user.id).all()
+            return render_template('edit_note.html', error=err, note=note, folders=folders)
         db.session.commit()
         return redirect(url_for('view_note', note_id=note.id))
     folders = Folder.query.filter_by(user_id=current_user.id).all()
@@ -270,6 +311,7 @@ def edit_note(note_id):
 @login_required
 def delete_note(note_id):
     note = get_or_404(Note, note_id)
+    own_or_403(note)
     db.session.delete(note)
     db.session.commit()
     return redirect(url_for('index'))
@@ -279,11 +321,12 @@ def delete_note(note_id):
 @login_required
 def toggle_public(note_id):
     note = get_or_404(Note, note_id)
+    own_or_403(note)
     note.is_public = not note.is_public
     db.session.commit()
     return redirect(url_for('view_note', note_id=note.id))
 
-# 分享
+# ── 分享 ──────────────────────────────────────────────────────
 
 @app.route('/share/<int:note_id>')
 def share_note(note_id):
@@ -301,7 +344,18 @@ def share_note(note_id):
     </script>
     '''
 
-# 搜索
+# ── 标签 ──────────────────────────────────────────────────────
+
+@app.route('/tags/<int:tag_id>')
+@login_required
+def view_tag(tag_id):
+    tag   = db.session.get(Tag, tag_id)
+    if tag is None:
+        from flask import abort; abort(404)
+    notes = [n for n in tag.notes if n.user_id == current_user.id]
+    return render_template('tag.html', tag=tag, notes=notes)
+
+# ── 搜索 ──────────────────────────────────────────────────────
 
 @app.route('/search')
 @login_required
@@ -317,7 +371,7 @@ def search():
                  .order_by(Note.created_at.desc()).all())
     return render_template('search.html', notes=notes, query=query)
 
-# 导入 / 导出
+# ── 导入 / 导出 ───────────────────────────────────────────────
 
 @app.route('/notes/import', methods=['POST'])
 @login_required
@@ -338,6 +392,7 @@ def import_note():
 @login_required
 def export_note(note_id):
     note             = get_or_404(Note, note_id)
+    own_or_403(note)
     encoded_filename = urllib.parse.quote(note.title + '.md')
     return Response(
         note.content,
@@ -345,29 +400,43 @@ def export_note(note_id):
         headers={'Content-Disposition': f"attachment; filename*=UTF-8''{encoded_filename}"},
     )
 
-# 文件夹
+# ── 文件夹 ────────────────────────────────────────────────────
 
 @app.route('/folders/new', methods=['POST'])
 @login_required
 def new_folder():
     name = request.form.get('name', '').strip()
-    if name:
-        db.session.add(Folder(name=name, user_id=current_user.id))
-        db.session.commit()
+    if not name:
+        return redirect(url_for('index'))
+    exists = Folder.query.filter_by(user_id=current_user.id, name=name).first()
+    if exists:
+        return redirect(url_for('index', folder_error='文件夹已存在', open_folder_form=1))
+    db.session.add(Folder(name=name, user_id=current_user.id))
+    db.session.commit()
     return redirect(url_for('index'))
+
+
+@app.route('/folders/<int:folder_id>')
+@login_required
+def view_folder(folder_id):
+    folder = get_or_404(Folder, folder_id)
+    own_or_403(folder)
+    notes = Note.query.filter_by(folder_id=folder_id, user_id=current_user.id).order_by(Note.created_at.desc()).all()
+    return render_template('folder.html', folder=folder, notes=notes)
 
 
 @app.route('/folders/<int:folder_id>/delete')
 @login_required
 def delete_folder(folder_id):
     folder = get_or_404(Folder, folder_id)
+    own_or_403(folder)
     for note in folder.notes:
         note.folder_id = None
     db.session.delete(folder)
     db.session.commit()
     return redirect(url_for('index'))
 
-# 启动 
+# ── 启动 ──────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     with app.app_context():
