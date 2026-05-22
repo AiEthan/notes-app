@@ -4,7 +4,11 @@ import json
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, Response, render_template, request, redirect, url_for
+# 加载环境变量（从 .env 文件）
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, Response, render_template, request, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
     LoginManager, UserMixin,
@@ -13,15 +17,18 @@ from flask_login import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
+# AI服务模块
+import ai_service
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-123'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///notes.db'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-123')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///notes.db')
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
-# ── 模板过滤器 ────────────────────────────────────────────────
+# 模板过滤器
 
 @app.template_filter('local_time')
 def local_time(dt):
@@ -53,7 +60,7 @@ def preview(content, query):
     snippet = pattern.sub(f'<mark>{query}</mark>', snippet)
     return ('...' if start > 0 else '') + snippet + ('...' if end < len(content) else '')
 
-# ── 数据模型 ──────────────────────────────────────────────────
+# 数据模型
 
 note_tags = db.Table(
     'note_tags',
@@ -79,7 +86,15 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     notes    = db.relationship('Note', backref='author', lazy=True)
+    comments = db.relationship('Comment', backref='author', lazy=True)
 
+
+class Comment(db.Model):
+    id         = db.Column(db.Integer, primary_key=True)
+    content    = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id    = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    note_id    = db.Column(db.Integer, db.ForeignKey('note.id'), nullable=False)
 
 class Note(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
@@ -90,9 +105,21 @@ class Note(db.Model):
     user_id    = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     folder_id  = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)
     is_public  = db.Column(db.Boolean, default=False)
-    tags       = db.relationship('Tag', secondary=note_tags, backref='notes', lazy='subquery')
+    is_deleted = db.Column(db.Boolean, default=False)
+    deleted_at = db.Column(db.DateTime, nullable=True)
+    tags       = db.relationship('Tag', secondary=note_tags, backref='notes')
+    comments   = db.relationship('Comment', backref='note', lazy=True, order_by='Comment.created_at.desc()', cascade='all, delete-orphan')
+    versions   = db.relationship('NoteVersion', backref='note', lazy=True, order_by='NoteVersion.created_at.desc()', cascade='all, delete-orphan')
 
-# ── 辅助函数 ──────────────────────────────────────────────────
+class NoteVersion(db.Model):
+    id            = db.Column(db.Integer, primary_key=True)
+    note_id       = db.Column(db.Integer, db.ForeignKey('note.id'), nullable=False)
+    title         = db.Column(db.String(200), nullable=False)
+    content       = db.Column(db.Text, nullable=False)
+    tags_snapshot = db.Column(db.Text, nullable=True)
+    created_at    = db.Column(db.DateTime, default=datetime.utcnow)
+
+# 辅助函数
 
 def get_or_404(model, pk):
     """兼容 SQLAlchemy 2.x 的 get_or_404。"""
@@ -103,30 +130,27 @@ def get_or_404(model, pk):
     return obj
 
 
-
-def own_or_403(obj):
-    """校验对象归属当前用户，否则 403。"""
-    from flask import abort
-    if obj.user_id != current_user.id:
-        abort(403)
-
 def sync_tags(note, raw_tags: str):
-    """将逗号分隔的标签字符串同步到 note.tags，返回错误信息或 None。"""
-    tag_names = [t.strip() for t in re.split(r'[,，]', raw_tags) if t.strip()]
-    for name in tag_names:
-        if len(name) > 50:
-            return f'标签"{name[:10]}..."超出50字符限制'
+    """将逗号分隔的标签字符串同步到 note.tags。
+    同一笔记内若出现多个同名标签会自动去重合并为一个。
+    """
+    raw_names = [t.strip() for t in raw_tags.split(',') if t.strip()]
+    # 按顺序去重，避免同一笔记绑定两个同名 Tag 触发 IntegrityError
+    seen = set()
+    tag_names = []
+    for name in raw_names:
+        if name not in seen:
+            seen.add(name)
+            tag_names.append(name)
     note.tags = []
     for name in tag_names:
         tag = Tag.query.filter_by(name=name).first()
         if not tag:
             tag = Tag(name=name)
             db.session.add(tag)
-            db.session.flush()
         note.tags.append(tag)
-    return None
 
-# ── 用户认证 ──────────────────────────────────────────────────
+# 用户认证
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -137,15 +161,14 @@ def load_user(user_id):
 def register():
     error = None
     if request.method == 'POST':
-        username         = request.form['username'].strip()
-        password         = request.form['password']
-        confirm_password = request.form['confirm_password']
-        if not username or not password or not confirm_password:
-            error = '请填写完整信息'
-        elif password != confirm_password:
-            error = '两次密码输入不一致'
-        elif User.query.filter_by(username=username).first():
-            error = '用户名已被占用'
+        username = request.form['username']
+        password = request.form['password']
+        if User.query.filter_by(username=username).first():
+            error = '用户名已存在'
+        elif len(password) < 8:
+            error = '密码长度不能少于8位'
+        elif not re.search(r'[A-Za-z]', password) or not re.search(r'\d', password):
+            error = '密码必须同时包含字母和数字'
         else:
             user = User(username=username, password=generate_password_hash(password))
             db.session.add(user)
@@ -194,22 +217,19 @@ def profile():
                 db.session.commit()
                 success = '用户名修改成功'
         elif action == 'password':
-            old_password     = request.form['old_password']
-            new_password     = request.form['new_password']
-            confirm_password = request.form['confirm_password']
-            if not old_password or not new_password or not confirm_password:
-                error = '请填写完整信息'
-            elif not check_password_hash(current_user.password, old_password):
+            old_password = request.form['old_password']
+            new_password = request.form['new_password']
+            if not check_password_hash(current_user.password, old_password):
                 error = '原密码错误'
-            elif new_password != confirm_password:
-                error = '两次输入的新密码不一致'
+            elif not new_password:
+                error = '新密码不能为空'
             else:
                 current_user.password = generate_password_hash(new_password)
                 db.session.commit()
                 success = '密码修改成功'
     return render_template('profile.html', error=error, success=success)
 
-# ── 主页 ──────────────────────────────────────────────────────
+# 主页
 
 @app.route('/')
 @login_required
@@ -217,7 +237,7 @@ def index():
     folder_id = request.args.get('folder_id')
     tag_id    = request.args.get('tag_id')
 
-    q = Note.query.filter_by(user_id=current_user.id)
+    q = Note.query.filter_by(user_id=current_user.id, is_deleted=False)
     if folder_id:
         q = q.filter_by(folder_id=folder_id)
     if tag_id:
@@ -230,48 +250,34 @@ def index():
     tags    = (Tag.query
                .join(note_tags)
                .join(Note)
-               .filter(Note.user_id == current_user.id)
+               .filter(Note.user_id == current_user.id, Note.is_deleted == False)
                .distinct().all())
 
-    folder_error     = request.args.get('folder_error')
-    open_folder_form = request.args.get('open_folder_form')
+    trash_count = Note.query.filter_by(user_id=current_user.id, is_deleted=True).count()
     return render_template(
         'index.html', notes=notes, folders=folders, tags=tags,
         current_folder_id=int(folder_id) if folder_id else None,
         current_tag_id=int(tag_id) if tag_id else None,
-        folder_error=folder_error,
-        open_folder_form=open_folder_form,
+        trash_count=trash_count,
     )
 
-# ── 笔记 CRUD ─────────────────────────────────────────────────
+# 笔记
 
 @app.route('/notes/new', methods=['GET', 'POST'])
 @login_required
 def new_note():
     if request.method == 'POST':
-        title     = request.form['title']
-        content   = request.form['content']
-        raw_tags  = request.form.get('tags', '')
-        folder_id = request.form.get('folder_id') or None
-
-        def redraw(error):
-            folders = Folder.query.filter_by(user_id=current_user.id).all()
-            return render_template('new_note.html', error=error, folders=folders,
-                                   form_title=title, form_content=content,
-                                   form_tags=raw_tags, form_folder_id=folder_id)
-
+        title   = request.form['title']
+        content = request.form['content']
         if not title.strip():
-            return redraw('标题不能为空')
-
-        # 提前校验标签，不创建 note 对象
-        tag_names = [t.strip() for t in __import__('re').split(r'[,，]', raw_tags) if t.strip()]
-        for name in tag_names:
-            if len(name) > 50:
-                return redraw(f'标签"{name[:10]}..."超出50字符限制')
-
-        note = Note(title=title, content=content,
-                    user_id=current_user.id, folder_id=folder_id)
-        sync_tags(note, raw_tags)
+            folders = Folder.query.filter_by(user_id=current_user.id).all()
+            return render_template('new_note.html', error='标题不能为空', folders=folders)
+        note = Note(
+            title=title, content=content,
+            user_id=current_user.id,
+            folder_id=request.form.get('folder_id') or None,
+        )
+        sync_tags(note, request.form.get('tags', ''))
         db.session.add(note)
         db.session.commit()
         return redirect(url_for('index'))
@@ -283,24 +289,87 @@ def new_note():
 @login_required
 def view_note(note_id):
     note = get_or_404(Note, note_id)
-    own_or_403(note)
     return render_template('view_note.html', note=note)
 
+
+# ==================== AI 功能路由 ====================
+
+@app.route('/api/notes/<int:note_id>/ai-summary', methods=['POST'])
+@login_required
+def ai_summary(note_id):
+    """AI摘要：一键生成当前笔记核心考点"""
+    note = get_or_404(Note, note_id)
+    try:
+        summary = ai_service.generate_summary(note.title, note.content)
+        return jsonify({'success': True, 'summary': summary})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/notes/<int:note_id>/ai-chat', methods=['POST'])
+@login_required
+def ai_chat(note_id):
+    """AI问答：基于当前笔记内容对话"""
+    note = get_or_404(Note, note_id)
+    data = request.get_json()
+    question = data.get('question', '').strip()
+    chat_history = data.get('history', [])
+    
+    if not question:
+        return jsonify({'success': False, 'error': '问题不能为空'}), 400
+    
+    try:
+        answer = ai_service.chat_with_note(note.title, note.content, question, chat_history)
+        return jsonify({'success': True, 'answer': answer})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/ai-recommend-tags', methods=['POST'])
+@login_required
+def ai_recommend_tags():
+    """AI智能标签推荐：根据内容推荐标签"""
+    data = request.get_json()
+    title = data.get('title', '').strip()
+    content = data.get('content', '').strip()
+    
+    if not content:
+        return jsonify({'success': False, 'error': '内容不能为空'}), 400
+    
+    try:
+        tags = ai_service.recommend_tags(title, content)
+        return jsonify({'success': True, 'tags': tags})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==================== 笔记编辑路由 ====================
 
 @app.route('/notes/<int:note_id>/edit', methods=['GET', 'POST'])
 @login_required
 def edit_note(note_id):
     note = get_or_404(Note, note_id)
-    own_or_403(note)
     if request.method == 'POST':
+        # Save version snapshot before updating
+        tags_str = ','.join(t.name for t in note.tags)
+        version = NoteVersion(
+            note_id=note.id,
+            title=note.title,
+            content=note.content,
+            tags_snapshot=tags_str,
+        )
+        db.session.add(version)
         note.title      = request.form['title']
         note.content    = request.form['content']
         note.folder_id  = request.form.get('folder_id') or None
         note.updated_at = datetime.utcnow()
-        err = sync_tags(note, request.form.get('tags', ''))
-        if err:
-            folders = Folder.query.filter_by(user_id=current_user.id).all()
-            return render_template('edit_note.html', error=err, note=note, folders=folders)
+        sync_tags(note, request.form.get('tags', ''))
         db.session.commit()
         return redirect(url_for('view_note', note_id=note.id))
     folders = Folder.query.filter_by(user_id=current_user.id).all()
@@ -311,8 +380,9 @@ def edit_note(note_id):
 @login_required
 def delete_note(note_id):
     note = get_or_404(Note, note_id)
-    own_or_403(note)
-    db.session.delete(note)
+    note.is_deleted = True
+    note.deleted_at = datetime.utcnow()
+    note.is_public = False
     db.session.commit()
     return redirect(url_for('index'))
 
@@ -321,12 +391,11 @@ def delete_note(note_id):
 @login_required
 def toggle_public(note_id):
     note = get_or_404(Note, note_id)
-    own_or_403(note)
     note.is_public = not note.is_public
     db.session.commit()
     return redirect(url_for('view_note', note_id=note.id))
 
-# ── 分享 ──────────────────────────────────────────────────────
+# 分享
 
 @app.route('/share/<int:note_id>')
 def share_note(note_id):
@@ -344,34 +413,44 @@ def share_note(note_id):
     </script>
     '''
 
-# ── 标签 ──────────────────────────────────────────────────────
-
-@app.route('/tags/<int:tag_id>')
-@login_required
-def view_tag(tag_id):
-    tag   = db.session.get(Tag, tag_id)
-    if tag is None:
-        from flask import abort; abort(404)
-    notes = [n for n in tag.notes if n.user_id == current_user.id]
-    return render_template('tag.html', tag=tag, notes=notes)
-
-# ── 搜索 ──────────────────────────────────────────────────────
+# 搜索
 
 @app.route('/search')
 @login_required
 def search():
-    query = request.args.get('q', '').strip()
-    notes = []
-    if query:
-        notes = (Note.query
-                 .filter(
-                     Note.user_id == current_user.id,
-                     Note.title.contains(query) | Note.content.contains(query),
-                 )
-                 .order_by(Note.created_at.desc()).all())
-    return render_template('search.html', notes=notes, query=query)
+    query    = request.args.get('q', '').strip()
+    scope    = request.args.get('scope', 'mine')
+    folder_id = request.args.get('folder_id')
+    tag_id    = request.args.get('tag_id')
 
-# ── 导入 / 导出 ───────────────────────────────────────────────
+    if scope == 'plaza':
+        # 广场搜索直接重定向到广场页
+        return redirect(url_for('plaza', q=query))
+
+    q = Note.query.filter_by(user_id=current_user.id, is_deleted=False)
+    if query:
+        q = q.filter(Note.title.contains(query) | Note.content.contains(query))
+    if folder_id:
+        q = q.filter_by(folder_id=folder_id)
+    if tag_id:
+        tag = db.session.get(Tag, int(tag_id))
+        if tag:
+            q = q.filter(Note.tags.contains(tag))
+    notes = q.order_by(Note.created_at.desc()).all()
+
+    folders = Folder.query.filter_by(user_id=current_user.id).all()
+    tags = (Tag.query
+            .join(note_tags)
+            .join(Note)
+            .filter(Note.user_id == current_user.id, Note.is_deleted == False)
+            .distinct().all())
+
+    return render_template('search.html', notes=notes, query=query,
+                           scope=scope, folders=folders, tags=tags,
+                           current_folder_id=int(folder_id) if folder_id else None,
+                           current_tag_id=int(tag_id) if tag_id else None)
+
+# 导入 / 导出
 
 @app.route('/notes/import', methods=['POST'])
 @login_required
@@ -392,7 +471,6 @@ def import_note():
 @login_required
 def export_note(note_id):
     note             = get_or_404(Note, note_id)
-    own_or_403(note)
     encoded_filename = urllib.parse.quote(note.title + '.md')
     return Response(
         note.content,
@@ -400,7 +478,7 @@ def export_note(note_id):
         headers={'Content-Disposition': f"attachment; filename*=UTF-8''{encoded_filename}"},
     )
 
-# ── 文件夹 ────────────────────────────────────────────────────
+# 文件夹
 
 @app.route('/folders/new', methods=['POST'])
 @login_required
@@ -408,9 +486,10 @@ def new_folder():
     name = request.form.get('name', '').strip()
     if not name:
         return redirect(url_for('index'))
-    exists = Folder.query.filter_by(user_id=current_user.id, name=name).first()
-    if exists:
-        return redirect(url_for('index', folder_error='文件夹已存在', open_folder_form=1))
+    # 同一用户下文件夹名唯一：重名时不新建，跳回首页并附带错误信息用于弹窗提示
+    existing = Folder.query.filter_by(user_id=current_user.id, name=name).first()
+    if existing:
+        return redirect(url_for('index', folder_error='duplicate', folder_name=name))
     db.session.add(Folder(name=name, user_id=current_user.id))
     db.session.commit()
     return redirect(url_for('index'))
@@ -420,8 +499,13 @@ def new_folder():
 @login_required
 def view_folder(folder_id):
     folder = get_or_404(Folder, folder_id)
-    own_or_403(folder)
-    notes = Note.query.filter_by(folder_id=folder_id, user_id=current_user.id).order_by(Note.created_at.desc()).all()
+    if folder.user_id != current_user.id:
+        from flask import abort
+        abort(403)
+    notes = (Note.query
+             .filter_by(user_id=current_user.id, folder_id=folder.id, is_deleted=False)
+             .order_by(Note.created_at.desc())
+             .all())
     return render_template('folder.html', folder=folder, notes=notes)
 
 
@@ -429,16 +513,167 @@ def view_folder(folder_id):
 @login_required
 def delete_folder(folder_id):
     folder = get_or_404(Folder, folder_id)
-    own_or_403(folder)
     for note in folder.notes:
         note.folder_id = None
     db.session.delete(folder)
     db.session.commit()
     return redirect(url_for('index'))
 
-# ── 启动 ──────────────────────────────────────────────────────
+# 笔记广场
+
+@app.route('/plaza')
+@login_required
+def plaza():
+    q = request.args.get('q', '').strip()
+    query = Note.query.filter_by(is_public=True)
+    if q:
+        query = query.filter(Note.title.contains(q) | Note.content.contains(q))
+    notes = query.order_by(Note.created_at.desc()).all()
+    return render_template('plaza.html', notes=notes, q=q)
+
+
+@app.route('/plaza/<int:note_id>')
+@login_required
+def plaza_note(note_id):
+    note = get_or_404(Note, note_id)
+    if not note.is_public:
+        from flask import abort
+        abort(403)
+    return render_template('plaza_note.html', note=note)
+
+
+@app.route('/plaza/<int:note_id>/comment', methods=['POST'])
+@login_required
+def add_comment(note_id):
+    note = get_or_404(Note, note_id)
+    if not note.is_public:
+        from flask import abort
+        abort(403)
+    content = request.form.get('content', '').strip()
+    if content:
+        comment = Comment(content=content, user_id=current_user.id, note_id=note.id)
+        db.session.add(comment)
+        db.session.commit()
+    return redirect(url_for('plaza_note', note_id=note.id))
+
+
+@app.route('/comments/<int:comment_id>/delete', methods=['POST'])
+@login_required
+def delete_comment(comment_id):
+    comment = db.session.get(Comment, comment_id)
+    if not comment:
+        from flask import abort
+        abort(404)
+    if comment.user_id != current_user.id:
+        from flask import abort
+        abort(403)
+    note_id = comment.note_id
+    db.session.delete(comment)
+    db.session.commit()
+    return redirect(url_for('plaza_note', note_id=note_id))
+
+# 标签
+
+@app.route('/tags/<int:tag_id>')
+@login_required
+def view_tag(tag_id):
+    tag = get_or_404(Tag, tag_id)
+    notes = Note.query.filter_by(user_id=current_user.id, is_deleted=False)\
+                     .filter(Note.tags.contains(tag))\
+                     .order_by(Note.created_at.desc()).all()
+    return render_template('tag.html', tag=tag, notes=notes)
+
+# 回收站
+
+@app.route('/trash')
+@login_required
+def trash():
+    notes = Note.query.filter_by(user_id=current_user.id, is_deleted=True).order_by(Note.deleted_at.desc()).all()
+    return render_template('trash.html', notes=notes)
+
+
+@app.route('/trash/<int:note_id>/restore', methods=['POST'])
+@login_required
+def restore_note(note_id):
+    note = get_or_404(Note, note_id)
+    note.is_deleted = False
+    note.deleted_at = None
+    db.session.commit()
+    return redirect(url_for('trash'))
+
+
+@app.route('/trash/<int:note_id>/permanent_delete', methods=['POST'])
+@login_required
+def permanent_delete_note(note_id):
+    note = get_or_404(Note, note_id)
+    db.session.delete(note)
+    db.session.commit()
+    return redirect(url_for('trash'))
+
+# 历史版本
+
+@app.route('/notes/<int:note_id>/history')
+@login_required
+def note_history(note_id):
+    note = get_or_404(Note, note_id)
+    versions = NoteVersion.query.filter_by(note_id=note_id).order_by(NoteVersion.created_at.desc()).all()
+    return render_template('note_history.html', note=note, versions=versions)
+
+
+@app.route('/notes/<int:note_id>/history/<int:version_id>')
+@login_required
+def note_version(note_id, version_id):
+    note = get_or_404(Note, note_id)
+    version = get_or_404(NoteVersion, version_id)
+    if version.note_id != note.id:
+        from flask import abort
+        abort(404)
+    return render_template('note_version.html', note=note, version=version)
+
+
+@app.route('/notes/<int:note_id>/history/<int:version_id>/rollback', methods=['POST'])
+@login_required
+def rollback_note(note_id, version_id):
+    note = get_or_404(Note, note_id)
+    version = get_or_404(NoteVersion, version_id)
+    if version.note_id != note.id:
+        from flask import abort
+        abort(404)
+    # Save current state as a new version before rollback
+    tags_str = ','.join(t.name for t in note.tags)
+    current_version = NoteVersion(
+        note_id=note.id,
+        title=note.title,
+        content=note.content,
+        tags_snapshot=tags_str,
+    )
+    db.session.add(current_version)
+    # Rollback to the selected version
+    note.title = version.title
+    note.content = version.content
+    note.updated_at = datetime.utcnow()
+    sync_tags(note, version.tags_snapshot or '')
+    db.session.commit()
+    return redirect(url_for('view_note', note_id=note.id))
+
+# 启动
 
 if __name__ == '__main__':
     with app.app_context():
+        # Auto-migrate: add new columns to existing tables
+        import sqlite3
+        db_path = os.path.join(app.instance_path, 'notes.db')
+        if os.path.exists(db_path):
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            # Add is_deleted / deleted_at to note table
+            cur.execute("PRAGMA table_info(note)")
+            note_cols = {row[1] for row in cur.fetchall()}
+            if 'is_deleted' not in note_cols:
+                cur.execute('ALTER TABLE note ADD COLUMN is_deleted BOOLEAN DEFAULT 0')
+            if 'deleted_at' not in note_cols:
+                cur.execute('ALTER TABLE note ADD COLUMN deleted_at DATETIME')
+            con.commit()
+            con.close()
         db.create_all()
     app.run(debug=True)
